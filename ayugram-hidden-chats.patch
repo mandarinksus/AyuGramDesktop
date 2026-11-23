@@ -1,0 +1,1046 @@
+diff --git a/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.h b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.h
+new file mode 100644
+--- /dev/null
++++ b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.h
+@@ -0,0 +1,25 @@
++// This is the source code of AyuGram for Desktop.
++//
++// We do not and cannot prevent the use of our code,
++// but be respectful and credit the original author.
++//
++// Copyright @Radolyn, 2026
++#pragma once
++
++#include "data/data_peer_id.h"
++
++class PeerData;
++class History;
++class HistoryItem;
++
++namespace AyuHiddenChats {
++
++void init();
++void reload();
++
++[[nodiscard]] bool isHidden(PeerId peerId);
++[[nodiscard]] bool isHidden(const PeerData *peer);
++[[nodiscard]] bool isHidden(const History *history);
++[[nodiscard]] bool isHidden(const HistoryItem *item);
++
++} // namespace AyuHiddenChats
+diff --git a/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.cpp b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.cpp
+new file mode 100644
+--- /dev/null
++++ b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.cpp
+@@ -0,0 +1,292 @@
++// This is the source code of AyuGram for Desktop.
++//
++// We do not and cannot prevent the use of our code,
++// but be respectful and credit the original author.
++//
++// Copyright @Radolyn, 2026
++#include "ayu/features/hidden_chats/hidden_chats.h"
++
++#include "data/data_channel.h"
++#include "data/data_chat.h"
++#include "data/data_peer.h"
++#include "history/history.h"
++#include "history/history_item.h"
++#include "settings.h"
++
++#include <atomic>
++
++namespace AyuHiddenChats {
++namespace {
++
++constexpr auto kBotApiChannelPrefix = BareId(1000000000000ULL);
++
++struct HiddenSets {
++	std::unordered_set<BareId> userIds;
++	std::unordered_set<BareId> chatIds;
++	std::unordered_set<BareId> channelIds;
++	std::unordered_set<BareId> anyBareIds;
++
++	[[nodiscard]] bool empty() const {
++		return userIds.empty()
++			&& chatIds.empty()
++			&& channelIds.empty()
++			&& anyBareIds.empty();
++	}
++
++	[[nodiscard]] size_t totalCount() const {
++		return userIds.size()
++			+ chatIds.size()
++			+ channelIds.size()
++			+ anyBareIds.size();
++	}
++};
++
++QReadWriteLock gLock;
++HiddenSets gSets;
++std::atomic<bool> gInitialized{ false };
++
++[[nodiscard]] bool parseDigits(
++		QStringView sv,
++		bool allowLeadingMinus,
++		bool &wasNegative,
++		BareId &out) {
++	wasNegative = false;
++	if (sv.isEmpty()) {
++		return false;
++	}
++	if (allowLeadingMinus && sv.startsWith(u'-')) {
++		wasNegative = true;
++		sv = sv.mid(1);
++	} else if (sv.startsWith(u'+')) {
++		sv = sv.mid(1);
++	}
++	if (sv.isEmpty()) {
++		return false;
++	}
++	for (const auto ch : sv) {
++		if (ch < u'0' || ch > u'9') {
++			return false;
++		}
++	}
++	auto ok = false;
++	const auto parsed = sv.toULongLong(&ok);
++	if (!ok || parsed == 0) {
++		return false;
++	}
++	out = parsed;
++	return true;
++}
++
++void parseToken(const QString &rawToken, HiddenSets &sets) {
++	const auto token = rawToken.trimmed();
++	if (token.isEmpty()) {
++		return;
++	}
++
++	static const auto kPrivateLinkRe = QRegularExpression(
++		u"^(?:https?://)?t\\.me/c/(\\d+)(?:/.*)?$"_q,
++		QRegularExpression::CaseInsensitiveOption);
++	const auto linkMatch = kPrivateLinkRe.match(token);
++	if (linkMatch.hasMatch()) {
++		auto ok = false;
++		const auto channelBare = linkMatch.capturedView(1).toULongLong(&ok);
++		if (ok && channelBare > 0) {
++			sets.channelIds.insert(channelBare);
++		}
++		return;
++	}
++
++	const auto lower = token.toLower();
++	if (lower.startsWith(u"user:"_q)) {
++		auto neg = false;
++		BareId val = 0;
++		if (parseDigits(QStringView(token).mid(5), false, neg, val)) {
++			sets.userIds.insert(val);
++		}
++		return;
++	}
++	if (lower.startsWith(u"chat:"_q)) {
++		auto neg = false;
++		BareId val = 0;
++		if (parseDigits(QStringView(token).mid(5), true, neg, val)) {
++			sets.chatIds.insert(val);
++		}
++		return;
++	}
++	if (lower.startsWith(u"channel:"_q)) {
++		auto neg = false;
++		BareId val = 0;
++		if (parseDigits(QStringView(token).mid(8), true, neg, val)) {
++			if (neg && val > kBotApiChannelPrefix) {
++				val -= kBotApiChannelPrefix;
++			}
++			sets.channelIds.insert(val);
++		}
++		return;
++	}
++
++	auto isNegative = false;
++	BareId absVal = 0;
++	if (!parseDigits(token, true, isNegative, absVal)) {
++		return;
++	}
++
++	if (isNegative) {
++		if (absVal > kBotApiChannelPrefix) {
++			sets.channelIds.insert(absVal - kBotApiChannelPrefix);
++		} else {
++			sets.chatIds.insert(absVal);
++			sets.channelIds.insert(absVal);
++		}
++	} else {
++		sets.anyBareIds.insert(absVal);
++	}
++}
++
++void parseLine(QString line, HiddenSets &sets) {
++	if (line.endsWith(u'\r')) {
++		line.chop(1);
++	}
++	auto cut = line.size();
++	if (const auto hashPos = line.indexOf(u'#'); hashPos >= 0) {
++		cut = std::min(cut, hashPos);
++	}
++	qsizetype searchFrom = 0;
++	while (searchFrom < cut) {
++		const auto slashPos = line.indexOf(u"//"_q, searchFrom);
++		if (slashPos < 0 || slashPos >= cut) {
++			break;
++		}
++		if (slashPos == 0 || line.at(slashPos - 1) != u':') {
++			cut = slashPos;
++			break;
++		}
++		searchFrom = slashPos + 2;
++	}
++	const auto body = line.left(cut).trimmed();
++	if (body.isEmpty()) {
++		return;
++	}
++	static const auto kSepRe = QRegularExpression(u"[\\s,;]+"_q);
++	const auto tokens = body.split(kSepRe, Qt::SkipEmptyParts);
++	for (const auto &token : tokens) {
++		parseToken(token, sets);
++	}
++}
++
++[[nodiscard]] std::vector<QString> collectCandidatePaths() {
++	std::vector<QString> result;
++	const auto addIfValid = [&](const QString &base, const QString &rel) {
++		if (!base.isEmpty()) {
++			result.push_back(QDir(base).filePath(rel));
++		}
++	};
++	addIfValid(cWorkingDir(), u"tdata/hidden_chats.txt"_q);
++	addIfValid(cWorkingDir(), u"hidden_chats.txt"_q);
++	addIfValid(cExeDir(), u"hidden_chats.txt"_q);
++	return result;
++}
++
++} // namespace
++
++void init() {
++	reload();
++}
++
++void reload() {
++	HiddenSets nextSets;
++	base::flat_set<QString> seenCanonicalPaths;
++
++	for (const auto &candidate : collectCandidatePaths()) {
++		const auto info = QFileInfo(candidate);
++		if (!info.exists() || !info.isFile()) {
++			continue;
++		}
++		const auto canonical = info.canonicalFilePath();
++		const auto dedupKey = canonical.isEmpty() ? candidate : canonical;
++		if (!seenCanonicalPaths.insert(dedupKey).second) {
++			continue;
++		}
++		QFile file(candidate);
++		if (!file.open(QIODevice::ReadOnly)) {
++			continue;
++		}
++		auto content = QString::fromUtf8(file.readAll());
++		if (content.startsWith(QChar(0xFEFF))) {
++			content.remove(0, 1);
++		}
++		const auto lines = content.split(u'\n');
++		for (const auto &line : lines) {
++			parseLine(line, nextSets);
++		}
++	}
++
++	{
++		QWriteLocker locker(&gLock);
++		gSets = std::move(nextSets);
++	}
++	gInitialized.store(true, std::memory_order_release);
++
++	QReadLocker locker(&gLock);
++	LOG(("AyuHiddenChats: loaded %1 entries")
++		.arg(static_cast<qulonglong>(gSets.totalCount())));
++}
++
++bool isHidden(PeerId peerId) {
++	if (!peerId) {
++		return false;
++	}
++	if (!gInitialized.load(std::memory_order_acquire)) {
++		init();
++	}
++	QReadLocker locker(&gLock);
++	if (gSets.empty()) {
++		return false;
++	}
++	if (peerIsUser(peerId)) {
++		const auto bare = peerToUser(peerId).bare;
++		return gSets.userIds.contains(bare)
++			|| gSets.anyBareIds.contains(bare);
++	}
++	if (peerIsChat(peerId)) {
++		const auto bare = peerToChat(peerId).bare;
++		return gSets.chatIds.contains(bare)
++			|| gSets.anyBareIds.contains(bare);
++	}
++	if (peerIsChannel(peerId)) {
++		const auto bare = peerToChannel(peerId).bare;
++		return gSets.channelIds.contains(bare)
++			|| gSets.anyBareIds.contains(bare);
++	}
++	return false;
++}
++
++bool isHidden(const PeerData *peer) {
++	if (!peer) {
++		return false;
++	}
++	if (isHidden(peer->id)) {
++		return true;
++	}
++	if (const auto migrated = peer->migrateTo()) {
++		if (isHidden(migrated->id)) {
++			return true;
++		}
++	}
++	if (const auto from = peer->migrateFrom()) {
++		if (isHidden(from->id)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool isHidden(const History *history) {
++	return history && isHidden(history->peer.get());
++}
++
++bool isHidden(const HistoryItem *item) {
++	return item && isHidden(item->history());
++}
++
++} // namespace AyuHiddenChats
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -247,6 +247,8 @@
+         ayu/features/filters/filters_cache_controller.h
+         ayu/features/filters/filters_utils.cpp
+         ayu/features/filters/filters_utils.h
++        ayu/features/hidden_chats/hidden_chats.cpp
++        ayu/features/hidden_chats/hidden_chats.h
+         ayu/data/messages_storage.cpp
+         ayu/data/messages_storage.h
+         ayu/data/entities.h
+diff --git a/Telegram/SourceFiles/ayu/ayu_infra.cpp b/Telegram/SourceFiles/ayu/ayu_infra.cpp
+--- a/Telegram/SourceFiles/ayu/ayu_infra.cpp
++++ b/Telegram/SourceFiles/ayu/ayu_infra.cpp
+@@ -11,6 +11,7 @@
+ #include "ayu/ayu_ui_settings.h"
+ #include "ayu/ayu_worker.h"
+ #include "ayu/data/ayu_database.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/ui/ayu_logo.h"
+ #include "features/translator/ayu_translator.h"
+ #include "lang/lang_instance.h"
+@@ -68,6 +69,7 @@
+ }
+ 
+ void init() {
++	AyuHiddenChats::init();
+ 	initLang();
+ 	initDatabase();
+ 	initUiSettings();
+diff --git a/Telegram/SourceFiles/history/history.cpp b/Telegram/SourceFiles/history/history.cpp
+--- a/Telegram/SourceFiles/history/history.cpp
++++ b/Telegram/SourceFiles/history/history.cpp
+@@ -86,6 +86,7 @@
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
+ #include "ayu/ayu_state.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ 
+ 
+ namespace {
+@@ -2492,7 +2493,7 @@
+ 	} else if (!wasKnown) {
+ 		updateChatListSortPosition();
+ 	}
+-	if (folder) {
++	if (folder && !AyuHiddenChats::isHidden(peer)) {
+ 		folder->registerOne(this);
+ 	}
+ 	session().changes().historyUpdated(this, UpdateFlag::Folder);
+@@ -2764,6 +2765,11 @@
+ }
+ 
+ Dialogs::UnreadState History::chatListUnreadState() const {
++	if (AyuHiddenChats::isHidden(peer)) {
++		auto empty = Dialogs::UnreadState();
++		empty.known = true;
++		return empty;
++	}
+ 	if (const auto forum = peer->forum()) {
+ 		return AdjustedForumUnreadState(forum->topicsList()->unreadState());
+ 	} else if (const auto monoforum = peer->monoforum()) {
+@@ -3410,6 +3416,9 @@
+ }
+ 
+ bool History::shouldBeInChatList() const {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return false;
++	}
+ 	if (peer->migrateTo() || !folderKnown()) {
+ 		return false;
+ 	} else if (const auto community = peer->asChannel()
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_pinned_list.cpp b/Telegram/SourceFiles/dialogs/dialogs_pinned_list.cpp
+--- a/Telegram/SourceFiles/dialogs/dialogs_pinned_list.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_pinned_list.cpp
+@@ -15,6 +15,9 @@
+ #include "data/data_session.h"
+ #include "data/data_forum.h"
+ 
++// AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
++
+ namespace Dialogs {
+ 
+ PinnedList::PinnedList(FilterId filterId, int limit)
+@@ -34,6 +37,9 @@
+ }
+ 
+ void PinnedList::addPinned(Key key) {
++	if (const auto peer = key.peer(); peer && AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	Expects(key.entry()->folderKnown());
+ 
+ 	addPinnedGetPosition(key);
+@@ -52,6 +58,11 @@
+ }
+ 
+ void PinnedList::setPinned(Key key, bool pinned) {
++	if (pinned) {
++		if (const auto peer = key.peer(); peer && AyuHiddenChats::isHidden(peer)) {
++			return;
++		}
++	}
+ 	Expects(key.entry()->folderKnown() || _filterId != 0);
+ 
+ 	if (pinned) {
+@@ -123,6 +134,9 @@
+ 	for (const auto &peer : list) {
+ 		peer.match([&](const MTPDdialogPeer &data) {
+ 			if (const auto peerId = peerFromMTP(data.vpeer())) {
++				if (AyuHiddenChats::isHidden(peerId)) {
++					return;
++				}
+ 				const auto peer = sublistsOwner->owner().peer(peerId);
+ 				addPinned(sublistsOwner->sublist(peer));
+ 			}
+@@ -148,12 +162,13 @@
+ 
+ 	const auto old = base::take(_data);
+ 
+-	const auto count = int(list.size());
+-	_data.reserve(count);
+-	for (auto i = 0; i != count; ++i) {
+-		const auto history = list[i];
++	_data.reserve(list.size());
++	for (const auto history : list) {
++		if (AyuHiddenChats::isHidden(history)) {
++			continue;
++		}
+ 		_data.emplace_back(history);
+-		history->cachePinnedIndex(_filterId, i + 1);
++		history->cachePinnedIndex(_filterId, int(_data.size()));
+ 	}
+ 
+ 	for (const auto &key : old) {
+diff --git a/Telegram/SourceFiles/data/data_chat_filters.cpp b/Telegram/SourceFiles/data/data_chat_filters.cpp
+--- a/Telegram/SourceFiles/data/data_chat_filters.cpp
++++ b/Telegram/SourceFiles/data/data_chat_filters.cpp
+@@ -27,6 +27,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ 
+ 
+ namespace Data {
+@@ -343,6 +344,9 @@
+ bool ChatFilter::contains(
+ 		not_null<History*> history,
+ 		bool ignoreFakeUnread) const {
++	if (AyuHiddenChats::isHidden(history)) {
++		return false;
++	}
+ 	const auto flag = [&] {
+ 		const auto peer = history->peer;
+ 		if (const auto user = peer->asUser()) {
+diff --git a/Telegram/SourceFiles/data/data_session.cpp b/Telegram/SourceFiles/data/data_session.cpp
+--- a/Telegram/SourceFiles/data/data_session.cpp
++++ b/Telegram/SourceFiles/data/data_session.cpp
+@@ -96,6 +96,7 @@
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
+ #include "ayu/data/messages_storage.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/features/filters/filters_controller.h"
+ #include "ayu/utils/telegram_helpers.h"
+ 
+@@ -1927,7 +1928,7 @@
+ 				"userIsContactChanged() called for a not loaded user!"));
+ 			return;
+ 		}
+-		if (user->isContact()) {
++		if (user->isContact() && !AyuHiddenChats::isHidden(user)) {
+ 			const auto history = this->history(user->id);
+ 			_contactsList.addByName(history);
+ 			if (!history->inChatList()) {
+@@ -5728,6 +5729,14 @@
+ 	using namespace Dialogs;
+ 
+ 	const auto entry = key.entry();
++	const auto sublist = entry->asSublist();
++	if ((sublist && AyuHiddenChats::isHidden(sublist->sublistPeer()))
++		|| AyuHiddenChats::isHidden(key.peer())) {
++		if (entry->inChatList()) {
++			removeChatListEntry(key);
++		}
++		return;
++	}
+ 	const auto history = entry->asHistory();
+ 	const auto topic = entry->asTopic();
+ 	const auto mainList = chatsListFor(entry);
+@@ -5831,7 +5840,11 @@
+ 		.key = key,
+ 		.existenceChanged = true
+ 	});
+-	if (_contactsList.contains(key)) {
++	const auto sublist = entry->asSublist();
++	const auto isHidden = (sublist
++		&& AyuHiddenChats::isHidden(sublist->sublistPeer()))
++		|| AyuHiddenChats::isHidden(key.peer());
++	if (_contactsList.contains(key) && !isHidden) {
+ 		if (!_contactsNoChatsList.contains(key)) {
+ 			_contactsNoChatsList.addByName(key);
+ 		}
+diff --git a/Telegram/SourceFiles/data/data_saved_sublist.cpp b/Telegram/SourceFiles/data/data_saved_sublist.cpp
+--- a/Telegram/SourceFiles/data/data_saved_sublist.cpp
++++ b/Telegram/SourceFiles/data/data_saved_sublist.cpp
+@@ -26,6 +26,9 @@
+ #include "main/main_session.h"
+ #include "window/notifications_manager.h"
+ 
++// AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
++
+ namespace Data {
+ namespace {
+ 
+@@ -903,6 +906,9 @@
+ }
+ 
+ bool SavedSublist::shouldBeInChatList() const {
++	if (AyuHiddenChats::isHidden(sublistPeer())) {
++		return false;
++	}
+ 	const auto monoforum = _parent->parentChat();
+ 	if (monoforum && (monoforum == sublistPeer())) {
+ 		return false;
+diff --git a/Telegram/SourceFiles/data/data_stories.cpp b/Telegram/SourceFiles/data/data_stories.cpp
+--- a/Telegram/SourceFiles/data/data_stories.cpp
++++ b/Telegram/SourceFiles/data/data_stories.cpp
+@@ -29,6 +29,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ 
+ 
+ namespace Data {
+@@ -243,6 +244,9 @@
+ 
+ void Stories::apply(const MTPDupdateStory &data) {
+ 	const auto peerId = peerFromMTP(data.vpeer());
++	if (AyuHiddenChats::isHidden(peerId)) {
++		return;
++	}
+ 	const auto peer = _owner->peer(peerId);
+ 	const auto now = base::unixtime::now();
+ 	const auto idDates = parseAndApply(peer, data.vstory(), now);
+@@ -444,6 +448,12 @@
+ 		data.vmax_read_id().value_or_empty(),
+ 		(already != end(_readTill) ? already->second : 0));
+ 	const auto peer = _owner->peer(peerId);
++	if (AyuHiddenChats::isHidden(peer)) {
++		applyDeletedFromSources(peerId, StorySourcesList::NotHidden);
++		applyDeletedFromSources(peerId, StorySourcesList::Hidden);
++		peer->setStoriesState(PeerData::StoriesState::None);
++		return;
++	}
+ 	auto result = StoriesSource{
+ 		.peer = peer,
+ 		.readTill = readTill,
+diff --git a/Telegram/SourceFiles/data/components/top_peers.cpp b/Telegram/SourceFiles/data/components/top_peers.cpp
+--- a/Telegram/SourceFiles/data/components/top_peers.cpp
++++ b/Telegram/SourceFiles/data/components/top_peers.cpp
+@@ -19,6 +19,9 @@
+ #include "storage/serialize_peer.h"
+ #include "storage/storage_account.h"
+ 
++// AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
++
+ namespace Data {
+ namespace {
+ 
+@@ -122,6 +125,9 @@
+ 	_session->local().readSearchSuggestions();
+ 
+ 	return _list
++		| ranges::view::filter([](const TopPeer &top) {
++			return !AyuHiddenChats::isHidden(top.peer);
++		})
+ 		| ranges::view::transform(&TopPeer::peer)
+ 		| ranges::to_vector;
+ }
+@@ -150,6 +156,9 @@
+ }
+ 
+ void TopPeers::increment(not_null<PeerData*> peer, TimeId date) {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	_session->local().readSearchSuggestions();
+ 
+ 	if (_disabled || date <= _lastReceivedDate) {
+@@ -246,7 +255,10 @@
+ 				}
+ 				_list = ranges::views::all(
+ 					data.vpeers().v
+-				) | ranges::views::transform([&](
++				) | ranges::views::filter([](const MTPTopPeer &top) {
++					return !AyuHiddenChats::isHidden(
++						peerFromMTP(top.data().vpeer()));
++				}) | ranges::views::transform([&](
+ 						const MTPTopPeer &top) {
+ 					return TopPeer{
+ 						owner->peer(peerFromMTP(top.data().vpeer())),
+@@ -342,10 +354,12 @@
+ 			stream);
+ 		stream >> rating;
+ 		if (stream.ok() && peer) {
+-			_list.push_back({
+-				.peer = peer,
+-				.rating = DeserializeRating(rating),
+-			});
++			if (!AyuHiddenChats::isHidden(peer)) {
++				_list.push_back({
++					.peer = peer,
++					.rating = DeserializeRating(rating),
++				});
++			}
+ 		} else {
+ 			DEBUG_LOG(("Suggestions: "
+ 				"Failed TopPeers reading %1 / %2.").arg(i + 1).arg(count));
+diff --git a/Telegram/SourceFiles/data/components/recent_peers.cpp b/Telegram/SourceFiles/data/components/recent_peers.cpp
+--- a/Telegram/SourceFiles/data/components/recent_peers.cpp
++++ b/Telegram/SourceFiles/data/components/recent_peers.cpp
+@@ -17,6 +17,9 @@
+ #include "storage/serialize_peer.h"
+ #include "storage/storage_account.h"
+ 
++// AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
++
+ namespace Data {
+ namespace {
+ 
+@@ -51,6 +54,9 @@
+ }
+ 
+ void RecentPeers::bump(not_null<PeerData*> peer) {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	_session->local().readSearchSuggestions();
+ 
+ 	if (!_list.empty() && _list.front() == peer) {
+@@ -124,7 +130,9 @@
+ 			streamAppVersion,
+ 			stream);
+ 		if (stream.ok() && peer) {
+-			_list.push_back(peer);
++			if (!AyuHiddenChats::isHidden(peer)) {
++				_list.push_back(peer);
++			}
+ 		} else {
+ 			_list.clear();
+ 			DEBUG_LOG(("Suggestions: Failed RecentPeers reading %1 / %2."
+@@ -152,6 +160,9 @@
+ }
+ 
+ void RecentPeers::chatOpenPush(not_null<Thread*> thread) {
++	if (AyuHiddenChats::isHidden(thread->peer())) {
++		return;
++	}
+ 	_opens.erase(
+ 		ranges::remove(_opens, nullptr, &base::weak_ptr<Thread>::get),
+ 		end(_opens));
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
+--- a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
+@@ -103,6 +103,7 @@
+ #include <unordered_map>
+ 
+ // AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/ui/ayu_userpic.h"
+ #include "ayu/utils/telegram_helpers.h"
+ #include "styles/style_ayu_icons.h"
+@@ -4459,6 +4460,9 @@
+ }
+ 
+ void InnerWidget::appendToFiltered(Key key) {
++	if (const auto peer = key.peer(); peer && AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	for (const auto &row : _filterResults) {
+ 		if (row.key() == key) {
+ 			return;
+@@ -4802,6 +4806,9 @@
+ 		: (!_openedForum || _searchState.inChat.topic())
+ 		? _searchState.inChat
+ 		: Key(_openedForum->history());
++	if (inject && AyuHiddenChats::isHidden(inject)) {
++		inject = nullptr;
++	}
+ 	if (inject
+ 		&& (globalSearch
+ 			|| !_searchState.inChat
+@@ -4820,6 +4827,12 @@
+ 	auto &results = toPreview ? _previewResults : _searchResults;
+ 	for (const auto &item : messages) {
+ 		const auto history = item->history();
++		if (AyuHiddenChats::isHidden(history)) {
++			if (fullCount > 0) {
++				--fullCount;
++			}
++			continue;
++		}
+ 		if (toPreview || !uniquePeers || !hasHistoryInResults(history)) {
+ 			const auto index = int(results.size());
+ 			const auto repaint = toPreview
+@@ -4856,6 +4869,9 @@
+ 	_peerSearchResults.reserve(result.peers.size()
+ 		+ result.sponsored.size());
+ 	for	(const auto &peer : result.my) {
++		if (AyuHiddenChats::isHidden(peer)) {
++			continue;
++		}
+ 		appendToFiltered(peer->owner().history(peer));
+ 	}
+ 	const auto inlist = [&](not_null<PeerData*> peer) {
+@@ -4868,7 +4884,9 @@
+ 	auto added = base::flat_set<not_null<PeerData*>>();
+ 	for (const auto &sponsored : result.sponsored) {
+ 		const auto peer = sponsored.peer;
+-		if (inlist(peer) || _sponsoredRemoved.contains(peer)) {
++		if (AyuHiddenChats::isHidden(peer)
++			|| inlist(peer)
++			|| _sponsoredRemoved.contains(peer)) {
+ 			continue;
+ 		}
+ 		_peerSearchResults.push_back(
+@@ -4880,7 +4898,9 @@
+ 		added.emplace(peer);
+ 	}
+ 	for (const auto &peer : result.peers) {
+-		if (added.contains(peer) || inlist(peer)) {
++		if (AyuHiddenChats::isHidden(peer)
++			|| added.contains(peer)
++			|| inlist(peer)) {
+ 			continue;
+ 		}
+ 		_peerSearchResults.push_back(
+@@ -4905,6 +4925,9 @@
+ 
+ 	_idSearchResults.clear();
+ 	for (const auto &peer : results) {
++		if (AyuHiddenChats::isHidden(peer)) {
++			continue;
++		}
+ 		_idSearchResults.push_back(
+ 			std::make_unique<PeerSearchResult>(peer));
+ 	}
+diff --git a/Telegram/SourceFiles/boxes/share_box.cpp b/Telegram/SourceFiles/boxes/share_box.cpp
+--- a/Telegram/SourceFiles/boxes/share_box.cpp
++++ b/Telegram/SourceFiles/boxes/share_box.cpp
+@@ -69,6 +69,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/features/forward/ayu_forward.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ 
+ 
+ class ShareBox::Inner final : public Ui::RpWidget {
+@@ -858,6 +859,9 @@
+ 	const auto addList = [&](not_null<Dialogs::IndexedList*> list) {
+ 		for (const auto &row : list->all()) {
+ 			if (const auto history = row->history()) {
++				if (AyuHiddenChats::isHidden(history)) {
++					continue;
++				}
+ 				if (!history->peer->isSelf()
+ 					&& (history->asForum()
+ 						|| JoinedCommunityChats(history->peer)
+@@ -1689,6 +1693,9 @@
+ 		for (const auto &data : list) {
+ 			if (const auto peer = _descriptor.session->data().peerLoaded(
+ 					peerFromMTP(data))) {
++				if (AyuHiddenChats::isHidden(peer)) {
++					continue;
++				}
+ 				const auto history = _descriptor.session->data().history(
+ 					peer);
+ 				if (!history->asForum()
+diff --git a/Telegram/SourceFiles/boxes/peer_list_controllers.cpp b/Telegram/SourceFiles/boxes/peer_list_controllers.cpp
+--- a/Telegram/SourceFiles/boxes/peer_list_controllers.cpp
++++ b/Telegram/SourceFiles/boxes/peer_list_controllers.cpp
+@@ -58,6 +58,7 @@
+ #include "styles/style_premium.h"
+ 
+ // AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "styles/style_ayu_icons.h"
+ 
+ 
+@@ -354,7 +355,7 @@
+ 		for (const auto &mtpPeer : list.v) {
+ 			const auto peer = _session->data().peerLoaded(
+ 				peerFromMTP(mtpPeer));
+-			if (peer) {
++			if (peer && !AyuHiddenChats::isHidden(peer)) {
+ 				delegate()->peerListSearchAddRow(peer);
+ 			}
+ 		}
+@@ -588,10 +589,16 @@
+ 
+ std::unique_ptr<PeerListRow> ChatsListBoxController::createSearchRow(
+ 		not_null<PeerData*> peer) {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return nullptr;
++	}
+ 	return createRow(peer->owner().history(peer));
+ }
+ 
+ bool ChatsListBoxController::appendRow(not_null<History*> history) {
++	if (AyuHiddenChats::isHidden(history)) {
++		return false;
++	}
+ 	if (auto row = delegate()->peerListFindRow(history->peer->id.value)) {
+ 		updateRowHook(static_cast<Row*>(row));
+ 		return false;
+@@ -870,6 +877,9 @@
+ }
+ 
+ bool ContactsBoxController::appendRow(not_null<UserData*> user) {
++	if (AyuHiddenChats::isHidden(user)) {
++		return false;
++	}
+ 	if (auto row = delegate()->peerListFindRow(user->id.value)) {
+ 		updateRowHook(row);
+ 		return false;
+diff --git a/Telegram/SourceFiles/window/notifications_manager.cpp b/Telegram/SourceFiles/window/notifications_manager.cpp
+--- a/Telegram/SourceFiles/window/notifications_manager.cpp
++++ b/Telegram/SourceFiles/window/notifications_manager.cpp
+@@ -56,6 +56,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/utils/telegram_helpers.h"
+ 
+ 
+@@ -453,7 +454,7 @@
+ 		thread->popNotification(notification);
+ 		return;
+ 	}
+-	if (isMessageHidden(item)) {
++	if (AyuHiddenChats::isHidden(item) || isMessageHidden(item)) {
+ 		thread->popNotification(notification);
+ 		return;
+ 	}
+diff --git a/Telegram/SourceFiles/window/window_session_controller.cpp b/Telegram/SourceFiles/window/window_session_controller.cpp
+--- a/Telegram/SourceFiles/window/window_session_controller.cpp
++++ b/Telegram/SourceFiles/window/window_session_controller.cpp
+@@ -132,6 +132,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ 
+ 
+ namespace Window {
+@@ -625,6 +626,9 @@
+ void SessionNavigation::showPeerByLinkResolved(
+ 		not_null<PeerData*> peer,
+ 		const PeerByLinkInfo &info) {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	auto params = SectionShow{
+ 		SectionShow::Way::Forward
+ 	};
+@@ -1240,6 +1244,9 @@
+ 		MsgId rootId,
+ 		MsgId commentId,
+ 		const SectionShow &params) {
++	if (AyuHiddenChats::isHidden(history)) {
++		return;
++	}
+ 	if (const auto topic = history->peer->forumTopicFor(rootId)) {
+ 		auto replies = topic->replies();
+ 		if (replies->unreadCountKnown()) {
+@@ -1365,6 +1372,9 @@
+ 		not_null<Data::SavedSublist*> sublist,
+ 		MsgId itemId,
+ 		const SectionShow &params) {
++	if (AyuHiddenChats::isHidden(sublist->sublistPeer())) {
++		return;
++	}
+ 	using namespace HistoryView;
+ 	auto memento = std::make_shared<ChatMemento>(
+ 		ChatViewId{
+@@ -1395,6 +1405,9 @@
+ void SessionNavigation::showPeerInfo(
+ 		not_null<PeerData*> peer,
+ 		const SectionShow &params) {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	//if (Adaptive::ThreeColumn()
+ 	//	&& !Core::App().settings().thirdSectionInfoEnabled()) {
+ 	//	Core::App().settings().setThirdSectionInfoEnabled(true);
+@@ -2220,6 +2233,9 @@
+ 		not_null<Data::Forum*> forum,
+ 		const SectionShow &params,
+ 		MsgId showAtMsgId) {
++	if (AyuHiddenChats::isHidden(forum->peer())) {
++		return;
++	}
+ 	const auto forced = params.forceTopicsList;
+ 	if (showForumInDifferentWindow(forum, params, showAtMsgId)) {
+ 		return;
+@@ -2824,6 +2840,9 @@
+ }
+ 
+ void SessionController::showPeer(not_null<PeerData*> peer, MsgId msgId) {
++	if (AyuHiddenChats::isHidden(peer)) {
++		return;
++	}
+ 	if (const auto channel = peer->asChannel()) {
+ 		if (channel->isCommunity()) {
+ 			showPeerInfo(channel, SectionShow());
+@@ -3156,6 +3175,10 @@
+ 		PeerId peerId,
+ 		const SectionShow &params,
+ 		MsgId msgId) {
++	if (AyuHiddenChats::isHidden(peerId)
++		|| AyuHiddenChats::isHidden(session().data().peerLoaded(peerId))) {
++		return;
++	}
+ 	if (const auto peer = session().data().peerLoaded(peerId)) {
+ 		if (const auto channel = peer->asChannel()) {
+ 			if (channel->isCommunity()) {
+@@ -3170,6 +3193,9 @@
+ void SessionController::showMessage(
+ 		not_null<const HistoryItem*> item,
+ 		const SectionShow &params) {
++	if (AyuHiddenChats::isHidden(item)) {
++		return;
++	}
+ 	_window->invokeForSessionController(
+ 		&item->history()->session().account(),
+ 		item->history()->peer,
+diff --git a/Telegram/SourceFiles/mainwidget.cpp b/Telegram/SourceFiles/mainwidget.cpp
+--- a/Telegram/SourceFiles/mainwidget.cpp
++++ b/Telegram/SourceFiles/mainwidget.cpp
+@@ -105,6 +105,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/features/forward/ayu_forward.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ 
+ 
+ namespace {
+@@ -1440,6 +1441,10 @@
+ 		PeerId peerId,
+ 		const SectionShow &params,
+ 		MsgId showAtMsgId) {
++	if (AyuHiddenChats::isHidden(peerId)
++		|| AyuHiddenChats::isHidden(session().data().peerLoaded(peerId))) {
++		return;
++	}
+ 	if (peerId && _controller->window().locked()) {
+ 		if (params.activation != anim::activation::background) {
+ 			_controller->window().activate();
+diff --git a/Telegram/SourceFiles/ayu/data/messages_storage.cpp b/Telegram/SourceFiles/ayu/data/messages_storage.cpp
+--- a/Telegram/SourceFiles/ayu/data/messages_storage.cpp
++++ b/Telegram/SourceFiles/ayu/data/messages_storage.cpp
+@@ -7,6 +7,7 @@
+ #include "ayu/data/messages_storage.h"
+ 
+ #include "ayu/data/ayu_database.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/utils/ayu_mapper.h"
+ #include "ayu/utils/telegram_helpers.h"
+ #include "base/unixtime.h"
+@@ -85,6 +86,9 @@
+ }
+ 
+ void addEditedMessage(not_null<HistoryItem *> item) {
++	if (AyuHiddenChats::isHidden(item)) {
++		return;
++	}
+ 	EditedMessage message;
+ 	map(item, message);
+ 
+@@ -112,6 +116,9 @@
+ }
+ 
+ void addDeletedMessage(not_null<HistoryItem*> item) {
++	if (AyuHiddenChats::isHidden(item)) {
++		return;
++	}
+ 	DeletedMessage message;
+ 	map(item, message);
+ 
+diff --git a/Telegram/SourceFiles/ayu/utils/telegram_helpers.cpp b/Telegram/SourceFiles/ayu/utils/telegram_helpers.cpp
+--- a/Telegram/SourceFiles/ayu/utils/telegram_helpers.cpp
++++ b/Telegram/SourceFiles/ayu/utils/telegram_helpers.cpp
+@@ -15,6 +15,7 @@
+ #include "ayu/data/entities.h"
+ #include "ayu/data/messages_storage.h"
+ #include "ayu/features/filters/filters_controller.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/ui/boxes/donate_info_box.h"
+ #include "ayu/ui/toasts.h"
+ #include "ayu/utils/rc_manager.h"
+@@ -714,6 +715,9 @@
+ }
+ 
+ bool isMessageSavable(const not_null<HistoryItem*> item) {
++	if (AyuHiddenChats::isHidden(item)) {
++		return false;
++	}
+ 	const auto &settings = AyuSettings::getInstance();
+ 
+ 	if (!settings.saveDeletedMessages()) {
