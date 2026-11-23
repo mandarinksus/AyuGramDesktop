@@ -103,6 +103,18 @@ jobs:
                   "        -DTG_OWT_FFMPEG_INCLUDE_PATH=$FFMPEG_PATH\n    cmake --build out --config Debug\nrelease:\n    cmake --build out --config Release",
                   "        -DTG_OWT_FFMPEG_INCLUDE_PATH=$FFMPEG_PATH\nrelease:\n    cmake --build out --config Release",
               ),
+              (
+                  r"    'ThirdParty\\msys64\\mingw64\\bin',",
+                  r"    'ThirdParty\\msys64\\ucrt64\\bin',",
+              ),
+              (
+                  "    powershell -Command \"iwr -OutFile ./msys64.exe https://github.com/msys2/msys2-installer/releases/download/2025-08-30/msys2-base-x86_64-20250830.sfx.exe\"\n    msys64.exe\n    del msys64.exe\n\n    bash -c \"pacman-key --init; pacman-key --populate; pacman -Syu --noconfirm\"\n    pacman -Syu --noconfirm ^\n        make ^\n        mingw-w64-x86_64-diffutils ^\n        mingw-w64-x86_64-gperf ^\n        mingw-w64-x86_64-nasm ^\n        mingw-w64-x86_64-perl ^\n        mingw-w64-x86_64-pkgconf",
+                  "    powershell -Command \"iwr -OutFile ./msys64.exe https://github.com/msys2/msys2-installer/releases/download/2026-09-27/msys2-base-x86_64-20260927.sfx.exe\"\n    msys64.exe\n    del msys64.exe\n\n    bash -c \"pacman-key --init; pacman-key --populate; pacman -Syu --noconfirm\"\n    pacman -Syu --noconfirm ^\n        make ^\n        mingw-w64-ucrt-x86_64-diffutils ^\n        mingw-w64-ucrt-x86_64-gperf ^\n        mingw-w64-ucrt-x86_64-nasm ^\n        mingw-w64-ucrt-x86_64-perl ^\n        mingw-w64-ucrt-x86_64-pkgconf",
+              ),
+              (
+                  "    git clone https://github.com/desktop-app/gyp.git\n    cd gyp\n    git checkout 5e2425c47b",
+                  "    git clone https://github.com/desktop-app/gyp.git\n    cd gyp\n    git checkout b5ef901cf1",
+              ),
           ]
 
           for i, (old, new) in enumerate(replacements, 1):
@@ -112,7 +124,7 @@ jobs:
 
           with open(path, 'w', encoding='utf-8', newline='\n') as f:
               f.write(text)
-          print("Patched prepare.py for Release-only Qt6 + tg_owt cleanly.")
+          print("Patched prepare.py for Release-only Qt6 + tg_owt + MSYS2 ucrt64 + gyp VS2026 cleanly.")
           PY
 
           echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
