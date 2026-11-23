@@ -68,9 +68,10 @@ jobs:
         run: |
           cd "$TBUILD/$REPO_NAME"
           if [ -f ayugram-hidden-chats.patch ]; then
-            sed -i 's/\r$//' ayugram-hidden-chats.patch
-            git apply --check ayugram-hidden-chats.patch
-            git apply ayugram-hidden-chats.patch
+            tr -d '\r' < ayugram-hidden-chats.patch > /tmp/hc.patch
+            git apply --check /tmp/hc.patch
+            git apply /tmp/hc.patch
+            rm -f /tmp/hc.patch
             git status -s
           fi
 
@@ -83,8 +84,40 @@ jobs:
 
           sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
 
+          python - <<'PY'
+          import os
+          path = os.path.join(os.environ['TBUILD'], os.environ['REPO_NAME'], os.environ['PREPARE_PATH'])
+          with open(path, 'r', encoding='utf-8') as f:
+              text = f.read()
+
+          replacements = [
+              (
+                  "release:\n    SET CONFIGURATIONS=-debug-and-release\nwin_asserts:\n    SET ASSERTS=-force-asserts\nwin:\n    \"\"\" + removeDir('\"%LIBS_DIR%\\\\Qt' + qt + '\"') + \"\"\"\n    SET MOZJPEG_DIR=%LIBS_DIR%\\\\mozjpeg\n    SET OPENSSL_DIR=%LIBS_DIR%\\\\openssl3\n    SET OPENSSL_LIBS_DIR=%OPENSSL_DIR%\\\\out\n    SET ZLIB_LIBS_DIR=%LIBS_DIR%\\\\zlib\n    SET WEBP_DIR=%LIBS_DIR%\\\\libwebp\n    SET LCMS2_DIR=%LIBS_DIR%\\\\liblcms2\n    configure -prefix \"%LIBS_DIR%\\\\Qt-%QT%\" ^\n        %CONFIGURATIONS% ^\n        %ASSERTS% ^\n        -force-debug-info ^\n        -opensource ^",
+                  "release:\n    SET CONFIGURATIONS=-release\nwin_asserts:\n    SET ASSERTS=-force-asserts\nwin:\n    \"\"\" + removeDir('\"%LIBS_DIR%\\\\Qt' + qt + '\"') + \"\"\"\n    SET MOZJPEG_DIR=%LIBS_DIR%\\\\mozjpeg\n    SET OPENSSL_DIR=%LIBS_DIR%\\\\openssl3\n    SET OPENSSL_LIBS_DIR=%OPENSSL_DIR%\\\\out\n    SET ZLIB_LIBS_DIR=%LIBS_DIR%\\\\zlib\n    SET WEBP_DIR=%LIBS_DIR%\\\\libwebp\n    SET LCMS2_DIR=%LIBS_DIR%\\\\liblcms2\n    configure -prefix \"%LIBS_DIR%\\\\Qt-%QT%\" ^\n        %CONFIGURATIONS% ^\n        %ASSERTS% ^\n        -opensource ^",
+              ),
+              (
+                  "    cmake --build . --config Debug\n    cmake --install . --config Debug\n    cmake --build .\n    cmake --install .",
+                  "    cmake --build .\n    cmake --install .",
+              ),
+              (
+                  "        -DTG_OWT_FFMPEG_INCLUDE_PATH=$FFMPEG_PATH\n    cmake --build out --config Debug\nrelease:\n    cmake --build out --config Release",
+                  "        -DTG_OWT_FFMPEG_INCLUDE_PATH=$FFMPEG_PATH\nrelease:\n    cmake --build out --config Release",
+              ),
+          ]
+
+          for i, (old, new) in enumerate(replacements, 1):
+              cnt = text.count(old)
+              assert cnt == 1, f"Replacement {i} expected count=1, got {cnt}"
+              text = text.replace(old, new, 1)
+
+          with open(path, 'w', encoding='utf-8', newline='\n') as f:
+              f.write(text)
+          print("Patched prepare.py for Release-only Qt6 + tg_owt cleanly.")
+          PY
+
           echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
           echo "$SDK" >> CACHE_KEY.txt
+          echo "qt6" >> CACHE_KEY.txt
           echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
 
           git config --global user.email "builder@example.com"
@@ -140,7 +173,7 @@ jobs:
         run: |
           set CARGO_INCREMENTAL=0
           cd %TBUILD%
-          %REPO_NAME%\Telegram\build\prepare\win.bat silent skip-debug
+          %REPO_NAME%\Telegram\build\prepare\win.bat silent qt6
 
       - name: Read configuration matrix.
         shell: bash
@@ -198,7 +231,7 @@ jobs:
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
 
-          call configure.bat ^
+          call configure.bat qt6 ^
           %TDESKTOP_BUILD_GENERATOR% ^
           -D TDESKTOP_API_ID=%TDESKTOP_API_ID% ^
           -D TDESKTOP_API_HASH=%TDESKTOP_API_HASH% ^
