@@ -2,7 +2,7 @@ diff --git a/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.h b/Tel
 new file mode 100644
 --- /dev/null
 +++ b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,52 @@
 +// This is the source code of AyuGram for Desktop.
 +//
 +// We do not and cannot prevent the use of our code,
@@ -17,22 +17,49 @@ new file mode 100644
 +class History;
 +class HistoryItem;
 +
++namespace Ui::Menu {
++struct MenuCallback;
++} // namespace Ui::Menu
++
++namespace Window {
++class SessionController;
++} // namespace Window
++
 +namespace AyuHiddenChats {
 +
 +void init();
-+void reload();
++
++[[nodiscard]] bool isManageMode();
++
++[[nodiscard]] bool isConfiguredHidden(PeerId peerId);
++[[nodiscard]] bool isConfiguredHidden(const PeerData *peer);
++[[nodiscard]] bool isConfiguredHidden(const History *history);
++[[nodiscard]] bool isConfiguredHidden(const HistoryItem *item);
 +
 +[[nodiscard]] bool isHidden(PeerId peerId);
 +[[nodiscard]] bool isHidden(const PeerData *peer);
 +[[nodiscard]] bool isHidden(const History *history);
 +[[nodiscard]] bool isHidden(const HistoryItem *item);
 +
++[[nodiscard]] bool tryHandleSecretSearchQuery(
++	const QString &query,
++	Window::SessionController *controller);
++
++void togglePeerHidden(
++	not_null<PeerData*> peer,
++	Window::SessionController *controller);
++
++void addContextMenuAction(
++	PeerData *peer,
++	not_null<Window::SessionController*> controller,
++	const Ui::Menu::MenuCallback &addCallback);
++
 +} // namespace AyuHiddenChats
 diff --git a/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.cpp b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.cpp
 new file mode 100644
 --- /dev/null
 +++ b/Telegram/SourceFiles/ayu/features/hidden_chats/hidden_chats.cpp
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,559 @@
 +// This is the source code of AyuGram for Desktop.
 +//
 +// We do not and cannot prevent the use of our code,
@@ -41,287 +68,554 @@ new file mode 100644
 +// Copyright @Radolyn, 2026
 +#include "ayu/features/hidden_chats/hidden_chats.h"
 +
++#include "core/application.h"
 +#include "data/data_channel.h"
 +#include "data/data_chat.h"
++#include "data/data_chat_filters.h"
++#include "data/data_folder.h"
 +#include "data/data_peer.h"
++#include "data/data_saved_messages.h"
++#include "data/data_saved_sublist.h"
++#include "data/data_session.h"
++#include "data/data_user.h"
++#include "dialogs/dialogs_indexed_list.h"
++#include "dialogs/dialogs_main_list.h"
 +#include "history/history.h"
 +#include "history/history_item.h"
++#include "main/main_account.h"
++#include "main/main_domain.h"
++#include "main/main_session.h"
 +#include "settings.h"
++#include "styles/style_menu_icons.h"
++#include "ui/widgets/menu/menu_add_action_callback.h"
++#include "window/notifications_manager.h"
++#include "window/window_session_controller.h"
 +
++#include <QtCore/QCryptographicHash>
++#include <QtCore/QRandomGenerator>
++#include <QtCore/QSaveFile>
 +#include <atomic>
 +
 +namespace AyuHiddenChats {
 +namespace {
 +
-+constexpr auto kBotApiChannelPrefix = BareId(1000000000000ULL);
++constexpr uint32 kBlobMagic = 0x53435631U;
++constexpr uint32 kMaxEntries = 100000U;
++constexpr int kNonceSize = 16;
++constexpr int kMacSize = 32;
++constexpr int kSecretLength = 12;
 +
-+struct HiddenSets {
-+	std::unordered_set<BareId> userIds;
-+	std::unordered_set<BareId> chatIds;
-+	std::unordered_set<BareId> channelIds;
-+	std::unordered_set<BareId> anyBareIds;
++constexpr uchar kCodeSalt[16] = {
++	0x7A, 0x3F, 0x91, 0xC4, 0x5E, 0x82, 0x19, 0xD7,
++	0xB0, 0x4C, 0x63, 0xE8, 0x2D, 0xA5, 0x07, 0xF1,
++};
 +
-+	[[nodiscard]] bool empty() const {
-+		return userIds.empty()
-+			&& chatIds.empty()
-+			&& channelIds.empty()
-+			&& anyBareIds.empty();
-+	}
++constexpr uchar kExpectedCodeHash[32] = {
++	0x67, 0x79, 0xAE, 0x1E, 0x9A, 0x5E, 0x16, 0xB3,
++	0x50, 0x0B, 0x9B, 0x2A, 0x5B, 0x7F, 0xFB, 0x09,
++	0x7F, 0x60, 0xAB, 0x6F, 0x13, 0x23, 0x98, 0x36,
++	0x22, 0x36, 0xB6, 0xAB, 0xF1, 0xD5, 0x9B, 0xBD,
++};
 +
-+	[[nodiscard]] size_t totalCount() const {
-+		return userIds.size()
-+			+ chatIds.size()
-+			+ channelIds.size()
-+			+ anyBareIds.size();
-+	}
++constexpr uchar kStorageEncKey[32] = {
++	0xC9, 0x14, 0x8B, 0x52, 0xE3, 0x6D, 0x47, 0xAF,
++	0x20, 0x9E, 0x71, 0x38, 0xFD, 0x05, 0xB6, 0xCA,
++	0x44, 0xD1, 0x89, 0x2F, 0x63, 0xBC, 0x17, 0x90,
++	0xEA, 0x58, 0x3C, 0x7E, 0xA2, 0x0B, 0xF4, 0x69,
++};
++
++constexpr uchar kStorageMacKey[32] = {
++	0x3B, 0xE7, 0x50, 0xA9, 0x1C, 0x84, 0xDF, 0x26,
++	0x95, 0x4D, 0xC2, 0x73, 0x08, 0xFA, 0x61, 0xBE,
++	0xD8, 0x29, 0x74, 0xCB, 0x10, 0x5F, 0xA3, 0x8E,
++	0x42, 0x97, 0xE5, 0x31, 0x6C, 0xB4, 0x0D, 0x7A,
 +};
 +
 +QReadWriteLock gLock;
-+HiddenSets gSets;
++std::unordered_set<uint64> gHiddenPeers;
 +std::atomic<bool> gInitialized{ false };
++std::atomic<bool> gHasAnyHidden{ false };
++std::atomic<bool> gManageMode{ false };
 +
-+[[nodiscard]] bool parseDigits(
-+		QStringView sv,
-+		bool allowLeadingMinus,
-+		bool &wasNegative,
-+		BareId &out) {
-+	wasNegative = false;
-+	if (sv.isEmpty()) {
-+		return false;
-+	}
-+	if (allowLeadingMinus && sv.startsWith(u'-')) {
-+		wasNegative = true;
-+		sv = sv.mid(1);
-+	} else if (sv.startsWith(u'+')) {
-+		sv = sv.mid(1);
-+	}
-+	if (sv.isEmpty()) {
-+		return false;
-+	}
-+	for (const auto ch : sv) {
-+		if (ch < u'0' || ch > u'9') {
-+			return false;
-+		}
-+	}
-+	auto ok = false;
-+	const auto parsed = sv.toULongLong(&ok);
-+	if (!ok || parsed == 0) {
-+		return false;
-+	}
-+	out = parsed;
-+	return true;
++void writeLe32(uchar *dst, uint32 val) {
++	dst[0] = static_cast<uchar>(val & 0xFFU);
++	dst[1] = static_cast<uchar>((val >> 8) & 0xFFU);
++	dst[2] = static_cast<uchar>((val >> 16) & 0xFFU);
++	dst[3] = static_cast<uchar>((val >> 24) & 0xFFU);
 +}
 +
-+void parseToken(const QString &rawToken, HiddenSets &sets) {
-+	const auto token = rawToken.trimmed();
-+	if (token.isEmpty()) {
-+		return;
++void writeLe64(uchar *dst, uint64 val) {
++	for (auto i = 0; i < 8; ++i) {
++		dst[i] = static_cast<uchar>((val >> (i * 8)) & 0xFFULL);
 +	}
++}
 +
-+	static const auto kPrivateLinkRe = QRegularExpression(
-+		u"^(?:https?://)?t\\.me/c/(\\d+)(?:/.*)?$"_q,
-+		QRegularExpression::CaseInsensitiveOption);
-+	const auto linkMatch = kPrivateLinkRe.match(token);
-+	if (linkMatch.hasMatch()) {
-+		auto ok = false;
-+		const auto channelBare = linkMatch.capturedView(1).toULongLong(&ok);
-+		if (ok && channelBare > 0) {
-+			sets.channelIds.insert(channelBare);
-+		}
-+		return;
-+	}
++[[nodiscard]] uint32 readLe32(const uchar *src) {
++	return uint32(src[0])
++		| (uint32(src[1]) << 8)
++		| (uint32(src[2]) << 16)
++		| (uint32(src[3]) << 24);
++}
 +
-+	const auto lower = token.toLower();
-+	if (lower.startsWith(u"user:"_q)) {
-+		auto neg = false;
-+		BareId val = 0;
-+		if (parseDigits(QStringView(token).mid(5), false, neg, val)) {
-+			sets.userIds.insert(val);
-+		}
-+		return;
++[[nodiscard]] uint64 readLe64(const uchar *src) {
++	uint64 val = 0;
++	for (auto i = 0; i < 8; ++i) {
++		val |= (uint64(src[i]) << (i * 8));
 +	}
-+	if (lower.startsWith(u"chat:"_q)) {
-+		auto neg = false;
-+		BareId val = 0;
-+		if (parseDigits(QStringView(token).mid(5), true, neg, val)) {
-+			sets.chatIds.insert(val);
++	return val;
++}
++
++void xorKeystream(QByteArray &buffer, const uchar *nonce) {
++	const auto total = int(buffer.size());
++	uint32 counter = 0;
++	for (auto offset = 0; offset < total; offset += 32, ++counter) {
++		uchar ctr[4] = {};
++		writeLe32(ctr, counter);
++
++		QCryptographicHash hash(QCryptographicHash::Sha256);
++		hash.addData(QByteArrayView(
++			reinterpret_cast<const char*>(kStorageEncKey),
++			sizeof(kStorageEncKey)));
++		hash.addData(QByteArrayView(
++			reinterpret_cast<const char*>(nonce),
++			kNonceSize));
++		hash.addData(QByteArrayView(
++			reinterpret_cast<const char*>(ctr),
++			sizeof(ctr)));
++		const auto stream = hash.result();
++
++		const auto chunk = std::min(32, total - offset);
++		for (auto i = 0; i < chunk; ++i) {
++			buffer[offset + i] = static_cast<char>(
++				static_cast<uchar>(buffer[offset + i])
++				^ static_cast<uchar>(stream[i]));
 +		}
-+		return;
 +	}
-+	if (lower.startsWith(u"channel:"_q)) {
-+		auto neg = false;
-+		BareId val = 0;
-+		if (parseDigits(QStringView(token).mid(8), true, neg, val)) {
-+			if (neg && val > kBotApiChannelPrefix) {
-+				val -= kBotApiChannelPrefix;
++}
++
++[[nodiscard]] QByteArray computeMac(
++		const uchar *nonce,
++		QByteArrayView ciphertext) {
++	QCryptographicHash mac(QCryptographicHash::Sha256);
++	mac.addData(QByteArrayView(
++		reinterpret_cast<const char*>(kStorageMacKey),
++		sizeof(kStorageMacKey)));
++	mac.addData(QByteArrayView(
++		reinterpret_cast<const char*>(nonce),
++		kNonceSize));
++	mac.addData(ciphertext);
++	return mac.result();
++}
++
++[[nodiscard]] bool verifySecretCode(QStringView candidate) {
++	const auto trimmed = candidate.trimmed();
++	if (trimmed.size() != kSecretLength) {
++		return false;
++	}
++	const auto utf8 = trimmed.toUtf8();
++	QCryptographicHash hash(QCryptographicHash::Sha256);
++	hash.addData(QByteArrayView(
++		reinterpret_cast<const char*>(kCodeSalt),
++		sizeof(kCodeSalt)));
++	hash.addData(QByteArrayView(utf8.constData(), utf8.size()));
++	const auto digest = hash.result();
++	if (digest.size() != int(sizeof(kExpectedCodeHash))) {
++		return false;
++	}
++	uchar diff = 0;
++	for (auto i = 0; i < int(sizeof(kExpectedCodeHash)); ++i) {
++		diff |= (static_cast<uchar>(digest[i]) ^ kExpectedCodeHash[i]);
++	}
++	return (diff == 0);
++}
++
++[[nodiscard]] QString storageFilePath() {
++	const auto base = cWorkingDir().isEmpty() ? cExeDir() : cWorkingDir();
++	if (base.isEmpty()) {
++		return QString();
++	}
++	return QDir(base).filePath(u"tdata/user_scache0"_q);
++}
++
++void loadFromDisk() {
++	std::unordered_set<uint64> loaded;
++	const auto path = storageFilePath();
++	if (!path.isEmpty()) {
++		QFile file(path);
++		if (file.exists() && file.open(QIODevice::ReadOnly)) {
++			const auto raw = file.readAll();
++			if (raw.size() >= (kNonceSize + 8 + kMacSize)) {
++				const auto *bytes = reinterpret_cast<const uchar*>(
++					raw.constData());
++				const auto cipherLen = int(raw.size()) - kNonceSize - kMacSize;
++				const auto cipherView = QByteArrayView(
++					raw.constData() + kNonceSize,
++					cipherLen);
++				const auto expectedMac = computeMac(bytes, cipherView);
++				const auto *storedMac = bytes + kNonceSize + cipherLen;
++
++				uchar macDiff = 0;
++				for (auto i = 0; i < kMacSize; ++i) {
++					macDiff |= (static_cast<uchar>(expectedMac[i]) ^ storedMac[i]);
++				}
++				if (macDiff == 0) {
++					auto plain = QByteArray(
++						raw.constData() + kNonceSize,
++						cipherLen);
++					xorKeystream(plain, bytes);
++					const auto *p = reinterpret_cast<const uchar*>(
++						plain.constData());
++					const auto magic = readLe32(p);
++					const auto count = readLe32(p + 4);
++					if (magic == kBlobMagic
++						&& count <= kMaxEntries
++						&& uint64(plain.size()) == (8ULL + uint64(count) * 8ULL)) {
++						loaded.reserve(count);
++						for (uint32 i = 0; i < count; ++i) {
++							const auto v = readLe64(p + 8 + i * 8);
++							if (v != 0) {
++								loaded.insert(v);
++							}
++						}
++					}
++				}
 +			}
-+			sets.channelIds.insert(val);
 +		}
++	}
++
++	const auto hasAny = !loaded.empty();
++	{
++		QWriteLocker locker(&gLock);
++		gHiddenPeers = std::move(loaded);
++	}
++	gHasAnyHidden.store(hasAny, std::memory_order_release);
++	gInitialized.store(true, std::memory_order_release);
++}
++
++void saveToDisk(const std::vector<uint64> &values) {
++	const auto path = storageFilePath();
++	if (path.isEmpty()) {
++		return;
++	}
++	if (values.empty()) {
++		QFile::remove(path);
 +		return;
 +	}
 +
-+	auto isNegative = false;
-+	BareId absVal = 0;
-+	if (!parseDigits(token, true, isNegative, absVal)) {
-+		return;
++	QDir().mkpath(QFileInfo(path).absolutePath());
++
++	uchar nonce[kNonceSize] = {};
++	writeLe64(nonce, QRandomGenerator::system()->generate64());
++	writeLe64(nonce + 8, QRandomGenerator::system()->generate64());
++
++	const auto count = static_cast<uint32>(
++		std::min<size_t>(values.size(), kMaxEntries));
++	QByteArray payload(int(8 + count * 8), Qt::Uninitialized);
++	auto *p = reinterpret_cast<uchar*>(payload.data());
++	writeLe32(p, kBlobMagic);
++	writeLe32(p + 4, count);
++	for (uint32 i = 0; i < count; ++i) {
++		writeLe64(p + 8 + i * 8, values[i]);
 +	}
 +
-+	if (isNegative) {
-+		if (absVal > kBotApiChannelPrefix) {
-+			sets.channelIds.insert(absVal - kBotApiChannelPrefix);
++	xorKeystream(payload, nonce);
++	const auto mac = computeMac(
++		nonce,
++		QByteArrayView(payload.constData(), payload.size()));
++
++	QByteArray out;
++	out.reserve(kNonceSize + payload.size() + kMacSize);
++	out.append(reinterpret_cast<const char*>(nonce), kNonceSize);
++	out.append(payload);
++	out.append(mac);
++
++	QSaveFile file(path);
++	if (file.open(QIODevice::WriteOnly)) {
++		file.write(out);
++		file.commit();
++	}
++}
++
++void refreshPeersInSession(
++		Data::Session &data,
++		const std::vector<not_null<PeerData*>> &peers) {
++	for (const auto peer : peers) {
++		if (isHidden(peer)) {
++			Core::App().closeChatFromWindows(peer);
++			if (const auto user = peer->asUser()) {
++				if (const auto history = data.historyLoaded(user)) {
++					data.contactsNoChatsList()->remove(history);
++					data.contactsList()->remove(history);
++				}
++			}
++			if (const auto history = data.historyLoaded(peer)) {
++				Core::App().notifications().clearFromHistory(history);
++				const auto wasInList = history->inChatList();
++				history->updateChatListExistence();
++				if (wasInList && !history->inChatList()) {
++					if (const auto folder = history->folder()) {
++						folder->unregisterOne(history);
++					}
++				}
++			}
++			if (const auto sublist = data.savedMessages().sublistLoaded(peer)) {
++				sublist->updateChatListExistence();
++			}
 +		} else {
-+			sets.chatIds.insert(absVal);
-+			sets.channelIds.insert(absVal);
++			if (const auto user = peer->asUser()
++				; user && user->isLoaded() && user->isContact()) {
++				const auto history = data.history(user);
++				if (!data.contactsList()->contains(history)) {
++					data.contactsList()->addByName(history);
++				}
++			}
++			if (const auto history = data.historyLoaded(peer)) {
++				if (history->folderKnown()) {
++					const auto wasInList = history->inChatList();
++					history->updateChatListSortPosition();
++					history->updateChatListExistence();
++					if (!wasInList && history->inChatList()) {
++						if (const auto folder = history->folder()) {
++							folder->registerOne(history);
++						}
++					}
++				}
++			}
++			if (const auto user = peer->asUser()
++				; user && user->isLoaded() && user->isContact()) {
++				const auto history = data.history(user);
++				if (!history->inChatList()
++					&& !data.contactsNoChatsList()->contains(history)) {
++					data.contactsNoChatsList()->addByName(history);
++				}
++			}
++			if (const auto sublist = data.savedMessages().sublistLoaded(peer)) {
++				sublist->updateChatListSortPosition();
++				sublist->updateChatListExistence();
++			}
 +		}
-+	} else {
-+		sets.anyBareIds.insert(absVal);
 +	}
++
++	if (const auto archive = data.folderLoaded(Data::Folder::kId)) {
++		archive->updateChatListSortPosition();
++		archive->updateChatListExistence();
++		archive->updateChatListEntry();
++	}
++	data.notifyUnreadBadgeChanged();
 +}
 +
-+void parseLine(QString line, HiddenSets &sets) {
-+	if (line.endsWith(u'\r')) {
-+		line.chop(1);
-+	}
-+	auto cut = line.size();
-+	if (const auto hashPos = line.indexOf(u'#'); hashPos >= 0) {
-+		cut = std::min(cut, hashPos);
-+	}
-+	qsizetype searchFrom = 0;
-+	while (searchFrom < cut) {
-+		const auto slashPos = line.indexOf(u"//"_q, searchFrom);
-+		if (slashPos < 0 || slashPos >= cut) {
-+			break;
-+		}
-+		if (slashPos == 0 || line.at(slashPos - 1) != u':') {
-+			cut = slashPos;
-+			break;
-+		}
-+		searchFrom = slashPos + 2;
-+	}
-+	const auto body = line.left(cut).trimmed();
-+	if (body.isEmpty()) {
++void refreshAllSessions() {
++	if (!Core::IsAppLaunched()) {
 +		return;
 +	}
-+	static const auto kSepRe = QRegularExpression(u"[\\s,;]+"_q);
-+	const auto tokens = body.split(kSepRe, Qt::SkipEmptyParts);
-+	for (const auto &token : tokens) {
-+		parseToken(token, sets);
++	auto &domain = Core::App().domain();
++	if (!domain.started()) {
++		return;
 +	}
++	for (const auto &[index, account] : domain.accounts()) {
++		if (const auto session = account->maybeSession()) {
++			auto &data = session->data();
++			std::vector<not_null<PeerData*>> targets;
++			data.enumerateUsers([&](not_null<UserData*> user) {
++				if (isConfiguredHidden(user)) {
++					targets.push_back(user);
++				}
++			});
++			data.enumerateGroups([&](not_null<PeerData*> group) {
++				if (isConfiguredHidden(group)) {
++					targets.push_back(group);
++				}
++			});
++			data.enumerateBroadcasts([&](not_null<ChannelData*> channel) {
++				if (isConfiguredHidden(channel)) {
++					targets.push_back(channel);
++				}
++			});
++			refreshPeersInSession(data, targets);
++		}
++	}
++	domain.notifyUnreadBadgeChanged();
 +}
 +
-+[[nodiscard]] std::vector<QString> collectCandidatePaths() {
-+	std::vector<QString> result;
-+	const auto addIfValid = [&](const QString &base, const QString &rel) {
-+		if (!base.isEmpty()) {
-+			result.push_back(QDir(base).filePath(rel));
++void refreshSpecificPeersAcrossSessions(const std::vector<PeerId> &peerIds) {
++	if (!Core::IsAppLaunched()) {
++		return;
++	}
++	auto &domain = Core::App().domain();
++	if (!domain.started()) {
++		return;
++	}
++	for (const auto &[index, account] : domain.accounts()) {
++		if (const auto session = account->maybeSession()) {
++			auto &data = session->data();
++			std::vector<not_null<PeerData*>> targets;
++			for (const auto id : peerIds) {
++				if (const auto loaded = data.peerLoaded(id)) {
++					targets.push_back(loaded);
++				}
++			}
++			if (!targets.empty()) {
++				refreshPeersInSession(data, targets);
++			}
 +		}
-+	};
-+	addIfValid(cWorkingDir(), u"tdata/hidden_chats.txt"_q);
-+	addIfValid(cWorkingDir(), u"hidden_chats.txt"_q);
-+	addIfValid(cExeDir(), u"hidden_chats.txt"_q);
-+	return result;
++	}
++	domain.notifyUnreadBadgeChanged();
 +}
 +
 +} // namespace
 +
 +void init() {
-+	reload();
++	gManageMode.store(false, std::memory_order_release);
++	loadFromDisk();
 +}
 +
-+void reload() {
-+	HiddenSets nextSets;
-+	base::flat_set<QString> seenCanonicalPaths;
-+
-+	for (const auto &candidate : collectCandidatePaths()) {
-+		const auto info = QFileInfo(candidate);
-+		if (!info.exists() || !info.isFile()) {
-+			continue;
-+		}
-+		const auto canonical = info.canonicalFilePath();
-+		const auto dedupKey = canonical.isEmpty() ? candidate : canonical;
-+		if (!seenCanonicalPaths.insert(dedupKey).second) {
-+			continue;
-+		}
-+		QFile file(candidate);
-+		if (!file.open(QIODevice::ReadOnly)) {
-+			continue;
-+		}
-+		auto content = QString::fromUtf8(file.readAll());
-+		if (content.startsWith(QChar(0xFEFF))) {
-+			content.remove(0, 1);
-+		}
-+		const auto lines = content.split(u'\n');
-+		for (const auto &line : lines) {
-+			parseLine(line, nextSets);
-+		}
-+	}
-+
-+	{
-+		QWriteLocker locker(&gLock);
-+		gSets = std::move(nextSets);
-+	}
-+	gInitialized.store(true, std::memory_order_release);
-+
-+	QReadLocker locker(&gLock);
-+	LOG(("AyuHiddenChats: loaded %1 entries")
-+		.arg(static_cast<qulonglong>(gSets.totalCount())));
++bool isManageMode() {
++	return gManageMode.load(std::memory_order_acquire);
 +}
 +
-+bool isHidden(PeerId peerId) {
++bool isConfiguredHidden(PeerId peerId) {
 +	if (!peerId) {
 +		return false;
 +	}
 +	if (!gInitialized.load(std::memory_order_acquire)) {
 +		init();
 +	}
-+	QReadLocker locker(&gLock);
-+	if (gSets.empty()) {
++	if (!gHasAnyHidden.load(std::memory_order_acquire)) {
 +		return false;
 +	}
-+	if (peerIsUser(peerId)) {
-+		const auto bare = peerToUser(peerId).bare;
-+		return gSets.userIds.contains(bare)
-+			|| gSets.anyBareIds.contains(bare);
-+	}
-+	if (peerIsChat(peerId)) {
-+		const auto bare = peerToChat(peerId).bare;
-+		return gSets.chatIds.contains(bare)
-+			|| gSets.anyBareIds.contains(bare);
-+	}
-+	if (peerIsChannel(peerId)) {
-+		const auto bare = peerToChannel(peerId).bare;
-+		return gSets.channelIds.contains(bare)
-+			|| gSets.anyBareIds.contains(bare);
-+	}
-+	return false;
++	QReadLocker locker(&gLock);
++	return gHiddenPeers.contains(peerId.value);
 +}
 +
-+bool isHidden(const PeerData *peer) {
++bool isConfiguredHidden(const PeerData *peer) {
 +	if (!peer) {
 +		return false;
 +	}
-+	if (isHidden(peer->id)) {
++	if (isConfiguredHidden(peer->id)) {
 +		return true;
 +	}
 +	if (const auto migrated = peer->migrateTo()) {
-+		if (isHidden(migrated->id)) {
++		if (isConfiguredHidden(migrated->id)) {
 +			return true;
 +		}
 +	}
 +	if (const auto from = peer->migrateFrom()) {
-+		if (isHidden(from->id)) {
++		if (isConfiguredHidden(from->id)) {
 +			return true;
 +		}
 +	}
 +	return false;
 +}
 +
++bool isConfiguredHidden(const History *history) {
++	return history && isConfiguredHidden(history->peer.get());
++}
++
++bool isConfiguredHidden(const HistoryItem *item) {
++	return item && isConfiguredHidden(item->history());
++}
++
++bool isHidden(PeerId peerId) {
++	return !isManageMode() && isConfiguredHidden(peerId);
++}
++
++bool isHidden(const PeerData *peer) {
++	return !isManageMode() && isConfiguredHidden(peer);
++}
++
 +bool isHidden(const History *history) {
-+	return history && isHidden(history->peer.get());
++	return !isManageMode() && isConfiguredHidden(history);
 +}
 +
 +bool isHidden(const HistoryItem *item) {
-+	return item && isHidden(item->history());
++	return !isManageMode() && isConfiguredHidden(item);
++}
++
++bool tryHandleSecretSearchQuery(
++		const QString &query,
++		Window::SessionController *controller) {
++	if (!verifySecretCode(query)) {
++		return false;
++	}
++	if (!gInitialized.load(std::memory_order_acquire)) {
++		init();
++	}
++	const auto nextMode = !gManageMode.load(std::memory_order_acquire);
++	gManageMode.store(nextMode, std::memory_order_release);
++	refreshAllSessions();
++
++	if (controller) {
++		controller->showToast(nextMode
++			? u"Режим прихованих чатів увімкнено (до перезапуску)"_q
++			: u"Приховані чати приховано"_q);
++	}
++	return true;
++}
++
++void togglePeerHidden(
++		not_null<PeerData*> peer,
++		Window::SessionController *controller) {
++	if (peer->isSelf()) {
++		return;
++	}
++	if (!gInitialized.load(std::memory_order_acquire)) {
++		init();
++	}
++
++	std::vector<PeerId> relatedIds;
++	relatedIds.push_back(peer->id);
++	if (const auto migrated = peer->migrateTo()) {
++		relatedIds.push_back(migrated->id);
++	}
++	if (const auto from = peer->migrateFrom()) {
++		relatedIds.push_back(from->id);
++	}
++
++	const auto wasHidden = isConfiguredHidden(peer);
++	std::vector<uint64> snapshot;
++	bool hasAny = false;
++	{
++		QWriteLocker locker(&gLock);
++		if (wasHidden) {
++			for (const auto id : relatedIds) {
++				gHiddenPeers.erase(id.value);
++			}
++		} else {
++			for (const auto id : relatedIds) {
++				if (id.value != 0) {
++					gHiddenPeers.insert(id.value);
++				}
++			}
++		}
++		hasAny = !gHiddenPeers.empty();
++		snapshot.assign(gHiddenPeers.begin(), gHiddenPeers.end());
++	}
++	gHasAnyHidden.store(hasAny, std::memory_order_release);
++	saveToDisk(snapshot);
++	refreshSpecificPeersAcrossSessions(relatedIds);
++
++	if (controller) {
++		controller->showToast(wasHidden
++			? u"Чат прибрано з прихованих"_q
++			: u"Чат додано до прихованих (зникне після перезапуску або коду в пошуку)"_q);
++	}
++}
++
++void addContextMenuAction(
++		PeerData *peer,
++		not_null<Window::SessionController*> controller,
++		const Ui::Menu::MenuCallback &addCallback) {
++	if (!peer || peer->isSelf() || !isManageMode()) {
++		return;
++	}
++	const auto hidden = isConfiguredHidden(peer);
++	const auto nonNullPeer = not_null<PeerData*>(peer);
++	addCallback(
++		hidden
++			? u"Показати чат (не приховувати)"_q
++			: u"Приховати чат"_q,
++		[=] { togglePeerHidden(nonNullPeer, controller); },
++		hidden ? &st::menuIconShowInChat : &st::menuIconStealth);
 +}
 +
 +} // namespace AyuHiddenChats
@@ -376,24 +670,18 @@ diff --git a/Telegram/SourceFiles/history/history.cpp b/Telegram/SourceFiles/his
  		folder->registerOne(this);
  	}
  	session().changes().historyUpdated(this, UpdateFlag::Folder);
-@@ -2764,6 +2765,11 @@
- }
- 
- Dialogs::UnreadState History::chatListUnreadState() const {
-+	if (AyuHiddenChats::isHidden(peer)) {
-+		auto empty = Dialogs::UnreadState();
-+		empty.known = true;
-+		return empty;
-+	}
- 	if (const auto forum = peer->forum()) {
- 		return AdjustedForumUnreadState(forum->topicsList()->unreadState());
- 	} else if (const auto monoforum = peer->monoforum()) {
-@@ -3410,6 +3416,9 @@
+@@ -3410,6 +3411,15 @@
  }
  
  bool History::shouldBeInChatList() const {
 +	if (AyuHiddenChats::isHidden(peer)) {
 +		return false;
++	}
++	if (AyuHiddenChats::isManageMode()
++		&& AyuHiddenChats::isConfiguredHidden(peer)
++		&& !peer->migrateTo()
++		&& folderKnown()) {
++		return true;
 +	}
  	if (peer->migrateTo() || !folderKnown()) {
  		return false;
@@ -462,6 +750,32 @@ diff --git a/Telegram/SourceFiles/dialogs/dialogs_pinned_list.cpp b/Telegram/Sou
  	}
  
  	for (const auto &key : old) {
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_widget.cpp b/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
+--- a/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
+@@ -110,6 +110,7 @@
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/utils/telegram_helpers.h"
+ #include "base/platform/base_platform_haptic.h"
+ 
+@@ -4030,6 +4031,14 @@
+ }
+ 
+ void Widget::applySearchUpdate() {
++	if (AyuHiddenChats::tryHandleSecretSearchQuery(
++			currentSearchQuery(),
++			controller())) {
++		cancelSearch({ .forceFullCancel = true });
++		clearSearchField();
++		_lastSearchText = QString();
++		return;
++	}
+ 	auto copy = _searchState;
+ 	copy.query = validateSearchQuery();
+ 	if (Ui::ScreenReaderModeActive() && !copy.query.isEmpty()) {
 diff --git a/Telegram/SourceFiles/data/data_chat_filters.cpp b/Telegram/SourceFiles/data/data_chat_filters.cpp
 --- a/Telegram/SourceFiles/data/data_chat_filters.cpp
 +++ b/Telegram/SourceFiles/data/data_chat_filters.cpp
@@ -878,6 +1192,57 @@ diff --git a/Telegram/SourceFiles/window/notifications_manager.cpp b/Telegram/So
  		thread->popNotification(notification);
  		return;
  	}
+diff --git a/Telegram/SourceFiles/window/window_peer_menu.cpp b/Telegram/SourceFiles/window/window_peer_menu.cpp
+--- a/Telegram/SourceFiles/window/window_peer_menu.cpp
++++ b/Telegram/SourceFiles/window/window_peer_menu.cpp
+@@ -140,6 +140,7 @@
+ #include <QtWidgets/QApplication>
+ 
+ // AyuGram includes
++#include "ayu/features/hidden_chats/hidden_chats.h"
+ #include "ayu/utils/telegram_helpers.h"
+ #include "styles/style_ayu_icons.h"
+ #include "ayu/ui/context_menu/context_menu.h"
+@@ -1860,6 +1861,9 @@
+ 	}
+ 	addCreateTopic();
+ 	addInfo();
++	if (!_topic) {
++		AyuHiddenChats::addContextMenuAction(_peer, _controller, _addAction);
++	}
+ 	addViewAsMessages();
+ 	const auto &all = _peer->forum()->topicsList()->indexed()->all();
+ 	if (all.size() > kTopicsSearchMinCount) {
+@@ -1907,6 +1911,9 @@
+ 	addHidePromotion();
+ 	addToggleArchive();
+ 	addTogglePin();
++	if (!_topic) {
++		AyuHiddenChats::addContextMenuAction(_peer, _controller, _addAction);
++	}
+ 	if (ViewProfileInChatsListContextMenu.value()) {
+ 		addInfo();
+ 	}
+@@ -1930,6 +1937,9 @@
+ void Filler::fillHistoryActions() {
+ 	addToggleMuteSubmenu(true);
+ 	AyuUi::AddAyuGramActions(_peer, _thread, _controller, _addAction);
++	if (!_topic) {
++		AyuHiddenChats::addContextMenuAction(_peer, _controller, _addAction);
++	}
+ 	addCreateTopic();
+ 	addInfo();
+ 	AyuUi::AddJumpToBeginningAction(_peer, _thread, _controller, _addAction);
+@@ -1972,6 +1982,9 @@
+ 	addToggleTopicClosed();
+ 	AyuUi::AddOpenChannelAction(_peer, _controller, _addAction);
+ 	AyuUi::AddShadowBanAction(_peer, _addAction);
++	if (!_topic) {
++		AyuHiddenChats::addContextMenuAction(_peer, _controller, _addAction);
++	}
+ 	addViewDiscussion();
+ 	addDirectMessages();
+ 	addExportChat();
 diff --git a/Telegram/SourceFiles/window/window_session_controller.cpp b/Telegram/SourceFiles/window/window_session_controller.cpp
 --- a/Telegram/SourceFiles/window/window_session_controller.cpp
 +++ b/Telegram/SourceFiles/window/window_session_controller.cpp
@@ -1007,7 +1372,7 @@ diff --git a/Telegram/SourceFiles/ayu/data/messages_storage.cpp b/Telegram/Sourc
  }
  
  void addEditedMessage(not_null<HistoryItem *> item) {
-+	if (AyuHiddenChats::isHidden(item)) {
++	if (AyuHiddenChats::isConfiguredHidden(item)) {
 +		return;
 +	}
  	EditedMessage message;
@@ -1017,7 +1382,7 @@ diff --git a/Telegram/SourceFiles/ayu/data/messages_storage.cpp b/Telegram/Sourc
  }
  
  void addDeletedMessage(not_null<HistoryItem*> item) {
-+	if (AyuHiddenChats::isHidden(item)) {
++	if (AyuHiddenChats::isConfiguredHidden(item)) {
 +		return;
 +	}
  	DeletedMessage message;
@@ -1038,7 +1403,7 @@ diff --git a/Telegram/SourceFiles/ayu/utils/telegram_helpers.cpp b/Telegram/Sour
  }
  
  bool isMessageSavable(const not_null<HistoryItem*> item) {
-+	if (AyuHiddenChats::isHidden(item)) {
++	if (AyuHiddenChats::isConfiguredHidden(item)) {
 +		return false;
 +	}
  	const auto &settings = AyuSettings::getInstance();
